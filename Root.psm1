@@ -1,13 +1,19 @@
-################################
+﻿################################
 # Import functions and classes #
 ################################
 
-$ClassesFiles = Get-ChildItem -Path "$PSScriptRoot\classes" -Filter "*.ps1"
-foreach ($file in $ClassesFiles) {
-    . $file.FullName
+[hashtable]$Params = @{
+    Filter      = "*.ps1"
+    File        = $true
+    ErrorAction = "Stop"
 }
 
-$FunctionFiles = Get-ChildItem -Path "$PSScriptRoot\functions" -Filter "*.ps1"
+# [System.IO.FileInfo[]]$ClassesFiles = Get-ChildItem -Path (Join-Path -Path $PSScriptRoot -ChildPath "classes") @Params
+# foreach ($file in $ClassesFiles) {
+#     . $file.FullName
+# }
+
+[System.IO.FileInfo[]]$FunctionFiles = Get-ChildItem -Path (Join-Path -Path $PSScriptRoot -ChildPath "functions") @Params
 foreach ($file in $FunctionFiles) {
     . $file.FullName
 }

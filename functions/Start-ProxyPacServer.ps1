@@ -37,6 +37,12 @@ function Start-ProxyPacServer {
         указывать вовсе или передать пустой массив — тогда используются только домены
         из глобальной переменной (если она задана).
 
+        Домены нужно указывать конкретно, без шаблонов: "github.com", а не "*.github.com"
+        и не ".github.com". Домен из списка сам по себе совпадает и с этим доменом, и со всеми
+        его поддоменами. Записи с "*" или ведущей точкой не совпадут ни с каким хостом —
+        прокси для них не включится, при этом никакой ошибки не будет (трафик пойдёт напрямую).
+        Это же правило относится к $global:ProxyPacServerDomains.
+
     .PARAMETER LogPath
         Путь к файлу лога. Если не указан, используется
         "$env:LOCALAPPDATA\ProxyPacServer\server.log". Недостающие родительские каталоги
@@ -119,11 +125,17 @@ function Start-ProxyPacServer {
 
     New-Item -ItemType Directory -Path (Split-Path -Path $LogPath -Parent) -Force | Out-Null
 
+    # PAC допускает только "PROXY host:port". Если передан URL ("http://host:port/"),
+    # отбрасываем схему и хвостовой слеш, иначе в PAC попадёт невалидная строка.
+    $ProxyServer = $ProxyServer.Trim() -replace '^[a-zA-Z][a-zA-Z0-9+.-]*://', '' -replace '/+$', ''
+
     # Получение общего списка доменов для проксирования.
     # @(...) оборачивает каждый источник в массив, а Where-Object отфильтровывает $null,
     # чтобы при отсутствии global:ProxyPacServerDomains и/или ProxiedDomains получался
     # настоящий пустой массив @(), а не массив с одним пустым/null-элементом.
     [string[]]$AllProxiedDomains = @(@($global:ProxyPacServerDomains) + @($ProxiedDomains) | Where-Object { $_ })
+
+    Write-Verbose -Message ("Домены для проксирования: {0}" -f ($AllProxiedDomains -join ", "))
 
     # Дописывает строку с меткой времени в лог-файл.
     function Write-Log([string]$Message) {
@@ -197,7 +209,12 @@ public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntP
         [hashtable]$TaskArgs = $CommonArgs.Clone()
         if ($SetWindowsProxy) { $TaskArgs.SetWindowsProxy = $true }
 
-        [string]$taskEncodedCommand = New-EncodedInvocation -Prelude ". $(ConvertTo-PSLiteral -Value $PSCommandPath)" -Call "Start-ProxyPacServer" -Arguments $TaskArgs
+        [hashtable]$taskEncodedCommandParams = @{
+            Prelude   = ". $(ConvertTo-PSLiteral -Value $PSCommandPath)"
+            Call      = "Start-ProxyPacServer"
+            Arguments = $TaskArgs
+        }
+        [string]$taskEncodedCommand = New-EncodedInvocation @taskEncodedCommandParams
         [string]$taskArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $taskEncodedCommand"
 
         [hashtable]$TaskParams = @{
@@ -221,29 +238,46 @@ public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntP
         return
     }
 
+    # Если порт уже занят (чаще всего — этим же PAC-сервером, запущенным ранее), новый воркер
+    # всё равно упал бы при Start() и записал ошибку только в лог. Поэтому проверяем заранее
+    # и ничего не запускаем. HttpListener слушает через http.sys, поэтому владелец порта
+    # в Get-NetTCPConnection отображается как System (PID 4) — по нему "свой/чужой" не отличить.
+    if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue) {
+        [string]$busyMessage = "Порт $Port уже занят (возможно, PAC-сервер уже запущен) — новый экземпляр не запущен."
+        Write-Warning -Message $busyMessage
+        Write-Log -Message $busyMessage
+        return
+    }
+
     # Само тело Start-ProxyPacServerWorker подставляется как текст, чтобы отсоединённому
     # процессу не нужно было ничего импортировать — он самодостаточен.
     [string]$workerDefinition = (Get-Command -Name "Start-ProxyPacServerWorker").ScriptBlock.ToString()
-    [string]$encodedCommand = New-EncodedInvocation -Prelude "function Start-ProxyPacServerWorker {`n$workerDefinition`n}" -Call "Start-ProxyPacServerWorker" -Arguments $CommonArgs
-
-    [hashtable]$StartProcessParams = @{
-        FilePath     = $pwshPath
-        ArgumentList = @(
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy", "Bypass",
-            "-EncodedCommand", $encodedCommand
-        )
-        WindowStyle  = "Hidden"
-        PassThru     = $true
+    [hashtable]$EncodedCommandParams = @{
+        Prelude   = "function Start-ProxyPacServerWorker {`n$workerDefinition`n}"
+        Call      = "Start-ProxyPacServerWorker"
+        Arguments = $CommonArgs
     }
+    [string]$encodedCommand = New-EncodedInvocation @EncodedCommandParams
+
+    # Воркер запускается через WMI (Win32_Process.Create), а не Start-Process: так процесс
+    # создаётся службой WMI и не входит в Job-объект вызывающего. Start-Process наследует
+    # Job родителя, и Планировщик заданий / терминал убивает воркера сразу после завершения
+    # задания или сессии — PAC-сервер пропадает, а Windows молча переходит на DIRECT.
+    [string]$workerCommandLine = '"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {1}' -f $pwshPath, $encodedCommand
 
     try {
-        $workerProcess = Start-Process @StartProcessParams
-        Write-Log "Запущен фоновый процесс PAC-сервера, PID: $($workerProcess.Id)"
+        $startupInfo = New-CimInstance -ClassName "Win32_ProcessStartup" -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+        $createResult = Invoke-CimMethod -ClassName "Win32_Process" -MethodName "Create" -Arguments @{
+            CommandLine               = $workerCommandLine
+            ProcessStartupInformation = $startupInfo
+        }
+        if ($createResult.ReturnValue -ne 0) {
+            throw "Win32_Process.Create вернул код $($createResult.ReturnValue)"
+        }
+        Write-Log -Message "Запущен фоновый процесс PAC-сервера, PID: $($createResult.ProcessId)"
     }
     catch {
-        Write-Log "Не удалось запустить фоновый процесс PAC-сервера: $_"
+        Write-Log -Message "Не удалось запустить фоновый процесс PAC-сервера: $_"
         throw
     }
 }
